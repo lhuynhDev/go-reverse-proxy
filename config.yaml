@@ -1,0 +1,13 @@
+# Proxy configuration
+listen: ":80"   # change to ":443" when adding TLS
+
+routes:
+  - prefix: /e1
+    backend: http://localhost:9010
+
+  - prefix: /e2
+    backend: http://localhost:8010
+
+  # Add more routes as needed:
+  # - prefix: /api
+  #   backend: http://localhost:3000
