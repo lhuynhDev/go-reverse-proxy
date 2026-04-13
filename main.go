@@ -40,6 +40,25 @@ func loadConfig(path string) (*Config, error) {
 	return &cfg, nil
 }
 
+// newDirectProxy creates a reverse proxy that forwards requests as-is (no prefix stripping).
+func newDirectProxy(rawBackend string) (*httputil.ReverseProxy, error) {
+	target, err := url.Parse(rawBackend)
+	if err != nil {
+		return nil, fmt.Errorf("invalid backend URL %q: %w", rawBackend, err)
+	}
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	originalDirector := proxy.Director
+	proxy.Director = func(req *http.Request) {
+		originalDirector(req)
+		req.Header.Set("X-Forwarded-Host", req.Host)
+	}
+	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+		log.Printf("proxy error [-> %s]: %v", rawBackend, err)
+		http.Error(w, "Bad Gateway", http.StatusBadGateway)
+	}
+	return proxy, nil
+}
+
 // newReverseProxy creates a reverse proxy that strips the prefix before forwarding.
 func newReverseProxy(prefix, rawBackend string) (http.Handler, error) {
 	target, err := url.Parse(rawBackend)
@@ -71,6 +90,19 @@ func newReverseProxy(prefix, rawBackend string) (http.Handler, error) {
 		// Forward the original host so backends can use it if needed.
 		req.Header.Set("X-Forwarded-Host", req.Host)
 		req.Header.Set("X-Forwarded-Prefix", prefix)
+	}
+
+	// Rewrite Location headers in redirect responses so they go back through the proxy.
+	proxy.ModifyResponse = func(resp *http.Response) error {
+		loc := resp.Header.Get("Location")
+		if loc == "" {
+			return nil
+		}
+		// Only rewrite absolute paths (relative to the backend root).
+		if strings.HasPrefix(loc, "/") {
+			resp.Header.Set("Location", prefix+loc)
+		}
+		return nil
 	}
 
 	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
@@ -128,8 +160,36 @@ func main() {
 		fmt.Fprintln(w, "ok")
 	})
 
-	// Catch-all: list available routes
+	// Build a map of prefix -> direct proxy for Referer-based fallback routing.
+	refererProxies := make(map[string]*httputil.ReverseProxy)
+	for _, route := range cfg.Routes {
+		prefix := route.Prefix
+		if !strings.HasPrefix(prefix, "/") {
+			prefix = "/" + prefix
+		}
+		dp, err := newDirectProxy(route.Backend)
+		if err != nil {
+			log.Fatalf("failed to create direct proxy for %s: %v", route.Backend, err)
+		}
+		refererProxies[prefix] = dp
+	}
+
+	// Catch-all: if the Referer matches a known route prefix, proxy to that backend.
+	// Otherwise, list available routes or 404.
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		referer := r.Header.Get("Referer")
+		if referer != "" {
+			if refURL, err := url.Parse(referer); err == nil {
+				for prefix, proxy := range refererProxies {
+					if strings.HasPrefix(refURL.Path, prefix) {
+						log.Printf("referer fallback: %s -> %s (via %s)", r.URL.Path, prefix, referer)
+						proxy.ServeHTTP(w, r)
+						return
+					}
+				}
+			}
+		}
+
 		if r.URL.Path != "/" {
 			http.NotFound(w, r)
 			return
